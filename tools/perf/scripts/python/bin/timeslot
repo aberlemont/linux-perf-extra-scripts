@@ -1,0 +1,5 @@
+#!/bin/bash
+# description: sort the events into timeslots
+# args: events=evt0,evt1,... [slot=slot-nsecs]
+
+perf script -s "$PERF_EXEC_PATH"/scripts/python/timeslot.py $@
