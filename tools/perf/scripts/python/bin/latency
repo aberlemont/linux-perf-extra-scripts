@@ -1,5 +1,5 @@
 #!/bin/bash
-# description: display latencies between events
+# description: display per-cpu latencies between events
 # args: events=evt0,evt1,... [histo[=bucket-nsecs,buckets-count]] [limit=limit-nsecs]
 
 perf script -s "$PERF_EXEC_PATH"/scripts/python/latency.py $@
