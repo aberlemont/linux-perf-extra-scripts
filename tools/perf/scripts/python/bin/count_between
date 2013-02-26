@@ -1,0 +1,5 @@
+#!/bin/bash
+# description: display per-cpu counts between two events
+# args: events=evt0,evt1,evt2 [histo[=per-bucket-count,buckets-count]]
+
+perf script -s "$PERF_EXEC_PATH"/scripts/python/count_between.py $@
