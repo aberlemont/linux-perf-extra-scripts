@@ -25,49 +25,100 @@ class Event:
             setattr(self, key, value)
 
 class Events:
-    def __init__(self):
-        self._events = {}
+    SIZE_THRESHOLD = 1024
+    LEFT_THRESHOLD = 128
 
+    def __init__(self, config):
+        self._config = config
+        self._events = {}
+        self._counts = {}
+        self._statistics = {}
+        self._histograms = {} if self._config.histo else None
+
+    def _add_cpu(self, cpu):
+        # ...so, for each cpu, we create a simple events
+        # container...
+        self._events[cpu] = []
+
+        # ...a counts processing instance...
+        self._counts[cpu] = Counts(self._config.events)
+
+        # ...a statistics processing instance...
+        self._statistics[cpu] = dict([(n, Statistics()) 
+                                      for n in self._counts[cpu].names])
+
+        # ...and a histogram instance
+        if self._config.histo:
+            self._histograms[cpu] = dict([(n, Histogram(*self._config.histo)) 
+                                          for n in self._counts[cpu].names])
+
+    def _process_counts(self, cpu, events):
+        for event in events:
+            self._counts[cpu].update(event)
+
+        for _name, _counts in self._counts[cpu].getitems().iteritems():
+            _statistics = self._statistics[cpu][_name]
+            for _count in _counts:
+                _statistics.update(_count)
+
+            if self._config.histo:
+                _histogram = self._histograms[cpu][_name]
+                for _count in _counts:
+                    _histogram.update(_count)
+        
     def append(self, other):
         cpu = other.cpu
+        # To prevent tricky cpu detection code, cpus are discovered
+        # through the events...
         if cpu not in self._events:
-            self._events[cpu] = []
+            self._add_cpu(cpu)
+
         self._events[cpu].append(other)
 
-    def sort(self):
-        for cpu in self._events:
+        if len(self._events[cpu]) > Events.SIZE_THRESHOLD:
             self._events[cpu].sort(lambda a,b: cmp(a.nsecs, b.nsecs))
+            
+            events_subset = self._events[cpu][:-Events.LEFT_THRESHOLD]
+            self._process_counts(cpu, events_subset)
 
+            self._events[cpu] = self._events[cpu][-Events.LEFT_THRESHOLD:]
+
+    def flush(self):
+        for cpu in self._events.keys():
+            self._events[cpu].sort(lambda a,b: cmp(a.nsecs, b.nsecs))
+            self._process_counts(cpu, self._events[cpu])
+            self._events[cpu] = []
+
+    def get_names(self):
+        if len(self._counts) == 0:
+            raise ValueError('No events detected')
+        first_key = self._counts.keys()[0]
+        return self._counts[first_key].names
+                    
     def get_cpus(self):
-        return self._events.keys()
+        return self._events.keys() + ['all']
 
-    def get_events(self, cpu):
-        return self._events[cpu]
+    def get_statistics(self, cpu, name):
+        if cpu == 'all':
+            all_stats = [self._statistics[c][name] for c in self._events.keys()]
+            return reduce(lambda x, y: x + y, all_stats)
+        else:
+            return self._statistics[cpu][name]
+
+    def get_histogram(self, cpu, name):
+        if cpu == 'all':
+            all_histos = [self._histograms[c][name] 
+                          for c in self._events.keys()]
+            return reduce(lambda x, y: x + y, all_histos)
+        else:
+            return self._histograms[cpu][name]
 
 # --- Counting part ---
 
 class Counts:
-    def __init__(self, names, events = None, counts = None):
-        if counts is None:
-            self._preset_names(names)
-            self._preset_values(names, events)
-        else:
-            self.names = names
-            self.counts = [c[:] for c in counts]
-
-    def __add__(self, other):
-        result = Counts(self.names, counts = self.counts)
-        result += other
-        return result
-
-    def __iadd__(self, other):
-        for i, values in enumerate(other.counts):
-            self.counts[i] += values
-        return self        
-
-    def __getitem__(self, name):
-        index = self.names.index(name)
-        return self.counts[index]
+    def __init__(self, names):
+        self._preset_names(names)
+        self._preset_values(names)
 
     def _preset_names(self, names):
         self.edges = [names[0], names[-1]]
@@ -75,43 +126,63 @@ class Counts:
 
         self._edges = [n.replace(':', '__') for n in self.edges]
         self._names = [n.replace(':', '__') for n in self.names]
-        
-    def _preset_values(self, names, events):
+
+    def _preset_values(self, names):
         # Build a map to translate event names to indexes
-        self.name_to_index = dict((n, i) for i, n in enumerate(self._names))
+        self._name_to_index = dict((n, i) for i, n in enumerate(self._names))
 
-        record = False
-        counts = None
-        all_counts = []
+        self._record_status = False
+        self._current_counts = None
+        self._all_counts = []
 
-        for event in events:
-            if event.name == self._edges[0]:
-                counts = [0 for _ in self.names]
-                record = True
-            elif event.name == self._edges[1]:
-                all_counts.append(counts)
-                counts = None
-                record = False
-            elif record and event.name in self.name_to_index:
-                index = self.name_to_index[event.name]
-                counts[index] += 1
+    def update(self, event):
+        if event.name == self._edges[0]:
+            self._current_counts = [0 for _ in self.names]
+            self._record_status = True
+        elif self._record_status and event.name == self._edges[1]:
+            self._all_counts.append(self._current_counts)
+            self._current_counts = None
+            self._record_status = False
+        elif self._record_status and event.name in self._name_to_index:
+            index = self._name_to_index[event.name]
+            self._current_counts[index] += 1
 
-        if len(all_counts) == 0:
-            all_counts.append([0] * len(self.names))
+    def getitems(self):
+        names = self.names
+        all_counts = self._all_counts
+        self._all_counts = []
 
-        self.counts = zip(*all_counts)
+        all_counts = zip(*all_counts) if len(all_counts) > 0 else ([] * len(names))
+        return dict([(n, all_counts[i]) for i, n in enumerate(names)])
 
 # --- Counts analysis part ---
 
 class Statistics:
-    def __init__(self, values = None):
-        self.min = 1000000000
-        self.max = 0
-        self.sum = 0
-        self.count = 0
-        if values is not None:
-            for value in values:
-                self.update(value)
+    def __init__(self, stats = None):
+        if stats is None:
+            self.min = 1000000000
+            self.max = 0
+            self.sum = 0
+            self.count = 0
+        else:
+            self.min = stats.min
+            self.max = stats.max
+            self.sum = stats.sum
+            self.count = stats.count
+
+    def __iadd__(self, other):
+        if other.min < self.min:
+            self.min = other.min
+        if other.max > self.max:
+            self.max = other.max
+        self.sum += other.sum
+        self.count += other.count
+        return self
+
+    def __add__(self, other):
+        result = Statistics(stats = self)
+        result += other
+        return result
 
     def update(self, value):
         if value < self.min:
@@ -127,16 +198,33 @@ class Statistics:
         return result
 
 class Histogram:
-    def __init__(self, values = None, bucket_size = 1000, buckets_count = 100):
-        self.step = bucket_size
-        self.count = buckets_count
-        self.buckets = [i for i in xrange(self.count)]
-        self.histo = [0 for i in xrange(self.count)]
-        self.overflow = 0
-        self.total = 0
-        if values is not None:
-            for value in values:
-                self.update(value)
+    def __init__(self, bucket_size = 10, buckets_count = 20, histo = None):
+        if histo is None:
+            self.step = bucket_size
+            self.count = buckets_count
+            self.buckets = [i for i in xrange(self.count)]
+            self.histo = [0 for i in xrange(self.count)]
+            self.overflow = 0
+            self.total = 0
+        else:
+            self.step = histo.step
+            self.count = histo.count
+            self.buckets = histo.buckets
+            self.histo = histo.histo[:]
+            self.overflow = histo.overflow
+            self.total = histo.total
+
+    def __iadd__(self, other):
+        for i, count in enumerate(other.histo):
+            self.histo[i] += count
+        self.overflow += other.overflow
+        self.total += other.total
+        return self
+
+    def __add__(self, other):
+        result = Histogram(histo = self)
+        result += other
+        return result
 
     def update(self, value):
         index = int(value / self.step)
@@ -195,40 +283,40 @@ class Options:
 
 # --- Report related part ---
 
-def print_legend(counts):
-    names = counts['all'].names
+def print_legend(events):
+    names = events.get_names()
 
     print '# === Legend ==='
     legends = ['# E{:02d}: {}'.format(i, n) for i, n in enumerate(names)]
     for legend in legends:
         print legend
     
-def print_stats(counts):
-    names = counts['all'].names
+def print_stats(events):
+    names = events.get_names()
+    cpus = events.get_cpus()
 
     print '# === Statistics: min avg max (ns) ==='
-    tmp = ['{:^23}'.format(k) for k in counts.keys()]
+    tmp = ['{:^23}'.format(c) for c in cpus]
     print '# cpus: ' + ' | '.join(tmp)
 
     for i, name in enumerate(names):
-        values = [Statistics(counts[k][name]).get_values() 
-                  for k in counts.keys()]
+        values = [events.get_statistics(c, name).get_values() for c in cpus]
         tmp = ['{:07d} {:07d} {:07d}'.format(v[0], v[2], v[1]) for v in values]
         line = '{:^6}: '.format('E{:02d}'.format(i)) + ' | '.join(tmp)
         print line
 
-def print_histograms(counts, bucket, count):
-    names = counts['all'].names
+def print_histograms(events):
+    names = events.get_names()
+    cpus = events.get_cpus()
+    bucket, count = events._config.histo
 
     print '# === Histograms: bucket:{} ==='.format(bucket)
 
     for i, name in enumerate(names):
-        tmp = ['{:^4}'.format(k) for k in counts.keys()]
+        tmp = ['{:^4}'.format(c) for c in cpus]
         print ' E{:02d} \ cpus: '.format(i) + ' | '.join(tmp)
 
-        histograms = [Histogram(counts[k][name], bucket, count) 
-                      for k in counts.keys()]
-        
+        histograms = [events.get_histogram(c, name) for c in cpus]
         values = [h.get_values() for h in histograms]
         overflows = [h.overflow for h in histograms]
         totals = [h.total for h in histograms]
@@ -248,8 +336,8 @@ def print_histograms(counts, bucket, count):
 
 # --- Perf related part ---
 
-events = None
 config = None
+events = None
 
 def trace_unhandled(event_name, context, fields):
     args = (event_name, 
@@ -267,24 +355,13 @@ def trace_begin():
 
     # Instanciate the global events holder
     global events
-    events = Events()
+    events = Events(config)
 
 def trace_end():
-    # Here we sort the per-CPU events according to their timestamps
-    events.sort()
-
-    # For each CPU, we generate the counts
-    counts = {}
-    for cpu in events.get_cpus():
-        _events = events.get_events(cpu)
-        counts[cpu] = Counts(config.events, _events)
-
-    # Gather all the per-cpu counts into a global set
-    counts['all'] = reduce(lambda a, b: a + b, counts.values())
-
+    events.flush()
     # Print the results (according to the configuration)
-    print_legend(counts)
-    print_stats(counts)
-    if config.histo is not None:
-        print_histograms(counts, *config.histo)
+    print_legend(events)
+    print_stats(events)
+    if config.histo:
+        print_histograms(events)
 
