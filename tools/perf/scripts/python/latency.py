@@ -24,127 +24,215 @@ class Event:
         for key, value in keywords.iteritems():
             setattr(self, key, value)
 
-class Events:
-    def __init__(self):
-        self._events = {}
 
+class Events:
+    SIZE_THRESHOLD = 1024
+    LEFT_THRESHOLD = 128
+
+    def __init__(self, config):
+        self._config = config
+        self._events = {}
+        self._latencies = {}
+        self._statistics = {}
+        self._histograms = {} if self._config.histo else None
+
+    def _add_cpu(self, cpu):
+        # ...so, for each cpu, we create a simple events
+        # container...
+        self._events[cpu] = []
+
+        # ...a latencies processing instance...
+        self._latencies[cpu] = Latencies(self._config.events, 
+                                         self._config.limit)
+
+        # ...a statistics processing instance...
+        self._statistics[cpu] = dict([(n, Statistics()) 
+                                      for n in self._latencies[cpu].names])
+
+        # ...and a histogram instance
+        if self._config.histo:
+            self._histograms[cpu] = dict([(n, Histogram(*self._config.histo)) 
+                                          for n in self._latencies[cpu].names])
+
+    def _process_latencies(self, cpu, events):
+        for event in events:
+            self._latencies[cpu].update(event)
+
+        for _name, _latencies in self._latencies[cpu].iteritems():
+            _statistics = self._statistics[cpu][_name]
+            for _latency in _latencies:
+                _statistics.update(_latency)
+
+            if self._config.histo:
+                _histogram = self._histograms[cpu][_name]
+                for _latency in _latencies:
+                    _histogram.update(_latency)
+        
     def append(self, other):
         cpu = other.cpu
+        # To prevent tricky cpu detection code, cpus are discovered
+        # through the events...
         if cpu not in self._events:
-            self._events[cpu] = []
+            self._add_cpu(cpu)
+
         self._events[cpu].append(other)
 
-    def sort(self):
-        for cpu in self._events:
+        if len(self._events[cpu]) > Events.SIZE_THRESHOLD:
             self._events[cpu].sort(lambda a,b: cmp(a.nsecs, b.nsecs))
+            
+            events_subset = self._events[cpu][:-Events.LEFT_THRESHOLD]
+            self._process_latencies(cpu, events_subset)
 
+            self._events[cpu] = self._events[cpu][-Events.LEFT_THRESHOLD:]
+
+    def flush(self):
+        for cpu in self._events.keys():
+            self._events[cpu].sort(lambda a,b: cmp(a.nsecs, b.nsecs))
+            self._process_latencies(cpu, self._events[cpu])
+            self._latencies[cpu].flush()
+            self._events[cpu] = []
+
+    def get_names(self):
+        if len(self._latencies) == 0:
+            raise ValueError('No events detected')
+        first_key = self._latencies.keys()[0]
+        return self._latencies[first_key].names
+                    
     def get_cpus(self):
-        return self._events.keys()
+        return self._events.keys() + ['all']
 
-    def get_events(self, cpu):
-        return self._events[cpu]
+    def get_statistics(self, cpu, name):
+        if cpu == 'all':
+            all_stats = [self._statistics[c][name] for c in self._events.keys()]
+            return reduce(lambda x, y: x + y, all_stats)
+        else:
+            return self._statistics[cpu][name]
+
+    def get_histogram(self, cpu, name):
+        if cpu == 'all':
+            all_histos = [self._histograms[c][name] 
+                          for c in self._events.keys()]
+            return reduce(lambda x, y: x + y, all_histos)
+        else:
+            return self._histograms[cpu][name]
 
 # --- Latencies generation part ---
 
 class Latencies:
-    def __init__(self, names, limit, events = None, latencies = None):
-        self.limit = limit
-        if latencies is None:
-            self._preset_names(names)
-            self._preset_values(names, events)
-        else:
-            self.names = names
-            self.latencies = [l[:] for l in latencies]
-
-    def __add__(self, other):
-        result = Latencies(self.names, self.limit, latencies = self.latencies)
-        result += other
-        return result
-
-    def __iadd__(self, other):
-        for i, values in enumerate(other.latencies):
-            self.latencies[i] += values
-        return self
-
-    def __getitem__(self, name):
-        index = self.names.index(name)
-        return self.latencies[index]
+    def __init__(self, names, limit):
+        self._preset_names(names)
+        self._preset_values(names, limit)
 
     def _preset_names(self, names):
-        # Set the latency names
+        # Keep the events names
+        self._names = [n.replace(':', '__') for n in names]
+
+        # Set the latencies names
         self.names = [names[i] + ' -> ' + names[i + 1] 
-                      for i in xrange(len(names) - 1)] + ['total']
+                                for i in xrange(len(names) - 1)] + ['total']
+
+    def _preset_values(self, names, limit):
+        self._limit = limit
 
         # Build a map to translate event names to indexes
-        names = [n.replace(':', '__') for n in names]
-        self.name_to_index = dict((n, i) for i, n in enumerate(names))
+        self._name_to_index = dict((n, i) for i, n in enumerate(self._names))
 
-    def _preset_values(self, names, events):
-        events_count = len(names)
-        self.latencies = [[] for i in xrange(events_count)]
+        self._latencies_count = len(self.names)
+        self._latencies = [[] for i in xrange(self._latencies_count)]
 
-        current_index = 0
-        index_to_nsecs = {}
+        self._current_index = 0
+        self._current_nsecs = {}
 
-        for event in events:
-            if event.name not in self.name_to_index.keys():
-                continue
+    def _compute_latencies(self):
+        # Here, we try to convert a cycle of timestamps into latencies
 
-            # Get the index of the event according to the order
-            # indicated by the user
-            index = self.name_to_index[event.name]
-
-            next_event = False
-            next_cycle = True
-            
-            while not next_event:
-                # If the events order is what we expected, we record
-                # the current event's timestamp
-                if index >= current_index:
-                    index_to_nsecs[index] = event.nsecs
-                    current_index = index + 1
-                    next_event = True
-                    next_cycle = False
-
-                # If the order is not proper or we reach the end of a
-                # cycle, let's compute the latencies
-                if next_cycle or current_index == events_count:
-                    self._compute_latencies(events_count, index_to_nsecs)
-                    index_to_nsecs = {}
-                    current_index = 0
-
-        self._compute_latencies(events_count, index_to_nsecs)
-
-    def _compute_latencies(self, events_count, times):
-        # Here, we just retrieve a cycle of timestamps we will try to
-        # convert into latencies
+        # Convenience variables
+        latencies_count = self._latencies_count
+        times = self._current_nsecs
         indexes = times.keys()
-        for i in xrange(events_count - 1):
+
+        for i in xrange(latencies_count - 1):
             # If two events occured in the order we expected, we can
             # calculate the related latency
             if i in indexes and i + 1 in indexes:
                 latency = times[i + 1] - times[i]
-                if latency < config.limit:
-                    self.latencies[i].append(latency)
+                if latency < self._limit:
+                    self._latencies[i].append(latency)
 
         # If the first and last events' timestamps, we can get the
         # total latency
-        if 0 in indexes and events_count - 1 in indexes:
-            latency = times[events_count - 1] - times[0]
-            if latency < config.limit:
-                self.latencies[-1].append(latency)
+        if 0 in indexes and latencies_count - 1 in indexes:
+            latency = times[latencies_count - 1] - times[0]
+            if latency < self._limit:
+                self._latencies[-1].append(latency)
+
+    def update(self, event):
+        # Skip the event if it is not in the list
+        if event.name not in self._name_to_index.keys():
+            return
+
+        # Get the index of the event
+        index = self._name_to_index[event.name]
+
+        next_event = False
+        next_cycle = True
+
+        while not next_event:
+            # If the events order is what we expected, we record
+            # the current event's timestamp
+            if index >= self._current_index:
+                self._current_nsecs[index] = event.nsecs
+                self._current_index = index + 1
+                next_event = True
+                next_cycle = False
+
+            # If the order is not proper or we reach the end of a
+            # cycle, let's compute the latencies
+            if next_cycle or self._current_index == self._latencies_count:
+                self._compute_latencies()
+                self._current_nsecs = {}
+                self._current_index = 0
+
+    def iteritems(self):
+        _latencies = self._latencies
+        self._latencies = [[] for i in xrange(self._latencies_count)]
+
+        _latencies = dict([(n, _latencies[i]) 
+                           for (i, n) in enumerate(self.names)])
+        for _values in _latencies.iteritems():
+            yield _values
+
+    def flush(self):
+        self._compute_latencies()
 
 # --- Latencies analysis part ---
 
 class Statistics:
-    def __init__(self, values = None):
-        self.min = 1000000000
-        self.max = 0
-        self.sum = 0
-        self.count = 0
-        if values is not None:
-            for value in values:
-                self.update(value)
+    def __init__(self, stats = None):
+        if stats is None:
+            self.min = 1000000000
+            self.max = 0
+            self.sum = 0
+            self.count = 0
+        else:
+            self.min = stats.min
+            self.max = stats.max
+            self.sum = stats.sum
+            self.count = stats.count
+
+    def __iadd__(self, other):
+        if other.min < self.min:
+            self.min = other.min
+        if other.max > self.max:
+            self.max = other.max
+        self.sum += other.sum
+        self.count += other.count
+        return self
+
+    def __add__(self, other):
+        result = Statistics(stats = self)
+        result += other
+        return result
 
     def update(self, value):
         if value < self.min:
@@ -160,16 +248,33 @@ class Statistics:
         return result
 
 class Histogram:
-    def __init__(self, values = None, bucket_size = 1000, buckets_count = 100):
-        self.step = bucket_size
-        self.count = buckets_count
-        self.buckets = [i for i in xrange(self.count)]
-        self.histo = [0 for i in xrange(self.count)]
-        self.overflow = 0
-        self.total = 0
-        if values is not None:
-            for value in values:
-                self.update(value)
+    def __init__(self, bucket_size = 10, buckets_count = 20, histo = None):
+        if histo is None:
+            self.step = bucket_size
+            self.count = buckets_count
+            self.buckets = [i for i in xrange(self.count)]
+            self.histo = [0 for i in xrange(self.count)]
+            self.overflow = 0
+            self.total = 0
+        else:
+            self.step = histo.step
+            self.count = histo.count
+            self.buckets = histo.buckets
+            self.histo = histo.histo[:]
+            self.overflow = histo.overflow
+            self.total = histo.total
+
+    def __iadd__(self, other):
+        for i, count in enumerate(other.histo):
+            self.histo[i] += count
+        self.overflow += other.overflow
+        self.total += other.total
+        return self
+
+    def __add__(self, other):
+        result = Histogram(histo = self)
+        result += other
+        return result
 
     def update(self, value):
         index = int(value / self.step)
@@ -240,40 +345,40 @@ class Options:
 
 # --- Report related part ---
 
-def print_legend(latencies):
-    names = latencies['all'].names
+def print_legend(events):
+    names = events.get_names()
 
     print '# === Legend ==='
     legends = ['# L{:02d}: {}'.format(i, n) for i, n in enumerate(names)]
     for legend in legends:
         print legend
     
-def print_stats(latencies):
-    names = latencies['all'].names
+def print_stats(events):
+    names = events.get_names()
+    cpus = events.get_cpus()
 
     print '# === Statistics: min avg max (ns) ==='
-    tmp = ['{:^23}'.format(k) for k in latencies.keys()]
+    tmp = ['{:^23}'.format(c) for c in cpus]
     print '# cpus: ' + ' | '.join(tmp)
 
     for i, name in enumerate(names):
-        values = [Statistics(latencies[k][name]).get_values() 
-                  for k in latencies.keys()]
+        values = [events.get_statistics(c, name).get_values() for c in cpus]
         tmp = ['{:07d} {:07d} {:07d}'.format(v[0], v[2], v[1]) for v in values]
         line = '{:^6}: '.format('L{:02d}'.format(i)) + ' | '.join(tmp)
         print line
 
-def print_histograms(latencies, bucket, count):
-    names = latencies['all'].names
+def print_histograms(events):
+    names = events.get_names()
+    cpus = events.get_cpus()
+    bucket, count = events._config.histo
 
     print '# === Histograms: bucket:{}ns ==='.format(bucket)
 
     for i, name in enumerate(names):
-        tmp = ['{:^4}'.format(k) for k in latencies.keys()]
+        tmp = ['{:^4}'.format(c) for c in cpus]
         print ' L{:02d} \ cpus: '.format(i) + ' | '.join(tmp)
 
-        histograms = [Histogram(latencies[k][name], bucket, count) 
-                      for k in latencies.keys()]
-        
+        histograms = [events.get_histogram(c, name) for c in cpus]
         values = [h.get_values() for h in histograms]
         overflows = [h.overflow for h in histograms]
         totals = [h.total for h in histograms]
@@ -312,24 +417,12 @@ def trace_begin():
 
     # Instanciate the global events holder
     global events
-    events = Events()
+    events = Events(config)
 
 def trace_end():
-    # Here we sort the per-CPU events according to their timestamps
-    events.sort()
-
-    # For each CPU, we generate the latencies
-    latencies = {}
-    for cpu in events.get_cpus():
-        _events = events.get_events(cpu)
-        latencies[cpu] = Latencies(config.events, config.limit, _events)
-
-    # Gather all the per-cpu latencies into a global set
-    latencies['all'] = reduce(lambda a, b: a + b, latencies.values())
-
+    events.flush()
     # Print the results (according to the configuration)
-    print_legend(latencies)
-    print_stats(latencies)
-    if config.histo is not None:
-        print_histograms(latencies, *config.histo)
-
+    print_legend(events)
+    print_stats(events)
+    if config.histo:
+        print_histograms(events)
