@@ -137,23 +137,36 @@ class Counts:
 
     def update(self, event):
         if event.name == self._edges[0]:
+            # If the current event is the start point, let's start the
+            # counting process
             self._current_counts = [0 for _ in self.names]
             self._record_status = True
+
         elif self._record_status and event.name == self._edges[1]:
+            # If the current event is the stop point, let's append the
+            # results
             self._all_counts.append(self._current_counts)
             self._current_counts = None
             self._record_status = False
+
         elif self._record_status and event.name in self._name_to_index:
+            # If the current event is between the edge events, let's
+            # count it            
             index = self._name_to_index[event.name]
             self._current_counts[index] += 1
 
     def getitems(self):
-        names = self.names
+        # Here, we return the results and flush them (we restart from
+        # scratch)
         all_counts = self._all_counts
         self._all_counts = []
 
-        all_counts = zip(*all_counts) if len(all_counts) > 0 else ([] * len(names))
-        return dict([(n, all_counts[i]) for i, n in enumerate(names)])
+        # The counts are gathered by counted event...
+        all_counts = zip(*all_counts) \
+            if len(all_counts) > 0 else ([] * len(self.names))
+
+        # ...and returned into a dict instance
+        return dict([(n, all_counts[i]) for i, n in enumerate(self.names)])
 
 # --- Counts analysis part ---
 
